@@ -2422,6 +2422,17 @@
       transition: background var(--t-tap), color var(--t-tap);
     }
 
+    .ed-bar [hidden] {
+      display: none;
+    }
+
+    /* the one button that changes the live site */
+    .ed-bar .ed-publish {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--bg);
+    }
+
     .ed-bar button:hover {
       background: var(--fg);
       color: var(--bg);
@@ -5478,6 +5489,7 @@
     <span class="ed-sep"></span>
     <button onclick="exportAll()" id="ed-export"
       title="Download your photos and one block to paste into the page, so the changes become permanent">Export</button>
+    <button onclick="publishSite()" id="ed-publish" class="ed-publish" hidden>Publish</button>
     <button onclick="edExit()">Done</button>
   </div>
 
@@ -7192,7 +7204,11 @@
       return out;
     }
 
-    async function exportAll() {
+    /* exportAll() downloads the photos and one block to paste.
+       exportAll({collect}) does the same work but hands everything back in
+       `collect` instead (used by Publish, which sends it to the local helper). */
+    async function exportAll(opts) {
+      const collect = opts && opts.collect;
       const btn = document.getElementById('ed-export');
       const was = btn ? btn.textContent : '';
       if (btn) { btn.textContent = 'Working…'; btn.disabled = true; }
@@ -7223,7 +7239,9 @@
         for (const [id, name] of Object.entries(idToName)) {
           const rec = byId.get(id);
           if (!rec || !rec.blob) { missing.push(name); continue; }
-          downloadBlob(await toJpegBlob(rec.blob), name + '.jpg');
+          const jpg = await toJpegBlob(rec.blob);
+          if (collect) { (collect.files = collect.files || []).push({ name, blob: jpg }); saved++; continue; }
+          downloadBlob(jpg, name + '.jpg');
           saved++;
           await new Promise(r => setTimeout(r, 160));   // browsers throttle bursts
         }
@@ -7298,8 +7316,10 @@
         ['removed', 'added', 'caps', 'adj', 'layouts', 'covers', 'subs', 'groups'].forEach(k => { if (!Object.keys(out[k] || {}).length) delete out[k]; });
 
         // an 'up:' left anywhere means a blob did not export — say so plainly
-        const text = JSON.stringify(out, null, 1);
+        // slash-after-angle-bracket is escaped, so a caption that contains a closing script tag cannot end the page's script early
+        const text = JSON.stringify(out, null, 1).replace(/<\//g, '<\\/');
         const stillUp = text.includes('"up:');
+        if (collect) { collect.out = out; collect.missing = missing; collect.stillUp = stillUp; return collect; }
         const block =
           `/* VELVET/THEORY export — ${new Date().toISOString()}
    1. Put the ${saved} downloaded .jpg file${saved === 1 ? '' : 's'} into the images/ folder (if any).
@@ -7322,6 +7342,301 @@ const BASE_CONTENT = ${text};
         alert('Export failed: ' + (err && err.message ? err.message : err));
       } finally {
         if (btn) { btn.textContent = was || 'Export'; btn.disabled = false; }
+      }
+    }
+
+    /* ================================================================
+       PUBLISH — from the editor to the live site.
+
+       Two ways, picked automatically:
+
+         cloud  The site's own Netlify Function (netlify/functions/admin.js).
+                Works from any device, on the live site, with no setup on the
+                editing side. It checks the owner password, commits to GitHub,
+                and Netlify redeploys from that commit.
+
+         local  The helper started by START-PORTFOLIO.bat (local-server.py),
+                which does the same from this computer using its own git.
+
+       If neither answers, the button stays hidden and Export + paste still
+       works exactly as before.
+       ================================================================ */
+    const TOKEN_KEY = 'vt-admin-token';
+    const PENDING_KEY = 'vt-pending-publish';
+    let publishMode = null;       // 'cloud' | 'local' | null
+    let publishToken = null;      // the local helper's token
+
+    async function cloudCall(body) {
+      let r, j = {};
+      try {
+        r = await fetch('/.netlify/functions/admin', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+        });
+      } catch (e) { return { ok: false, _status: 0, error: 'Could not reach the site. Check your connection.' }; }
+      try { j = await r.json(); } catch (e) { j = {}; }
+      j._status = r.status;
+      if (!r.ok && !j.error) j.error = 'The site answered HTTP ' + r.status + '.';
+      return j;
+    }
+
+    /* Decide whether Publish can work here, and show or hide the button. Runs
+       at load and again whenever the owner unlocks. */
+    async function detectPublisher() {
+      const btn = document.getElementById('ed-publish');
+      if (window.READONLY) { if (btn) btn.hidden = true; return; }
+      let mode = null, title = '';
+      if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+        try {
+          const r = await fetch('/__status', { cache: 'no-store' });
+          const j = r.ok ? await r.json() : null;
+          if (j && j.publish && j.token) {
+            mode = 'local'; publishToken = j.token;
+            title = 'Save, commit and push to GitHub from this computer (' + (j.branch || 'main') + ')';
+          }
+        } catch (e) { /* no helper running */ }
+      }
+      if (!mode && location.protocol !== 'file:') {
+        const j = await cloudCall({ action: 'ping' });
+        if (j.ok && j.configured) { mode = 'cloud'; title = 'Publish your changes to the live site'; }
+      }
+      publishMode = mode;
+      if (btn) { btn.hidden = !mode; btn.title = title; }
+    }
+    detectPublisher();
+
+    const blobToBase64 = blob => new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(String(fr.result).split(',')[1] || '');
+      fr.onerror = () => rej(fr.error || new Error('could not read a photo'));
+      fr.readAsDataURL(blob);
+    });
+
+    /* The same size the site is built at (1800px, high quality), small enough
+       to travel in one request. */
+    function webJpeg(blob, maxDim) {
+      maxDim = maxDim || 1800;
+      return new Promise((res, rej) => {
+        const u = URL.createObjectURL(blob);
+        const im = new Image();
+        im.onload = async () => {
+          URL.revokeObjectURL(u);
+          const k = Math.min(1, maxDim / Math.max(im.naturalWidth, im.naturalHeight));
+          const c = document.createElement('canvas');
+          c.width = Math.round(im.naturalWidth * k); c.height = Math.round(im.naturalHeight * k);
+          const g = c.getContext('2d');
+          g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+          g.imageSmoothingQuality = 'high';
+          g.drawImage(im, 0, 0, c.width, c.height);
+          for (const q of [.82, .74, .66, .58]) {
+            const b = await new Promise(r => c.toBlob(r, 'image/jpeg', q));
+            if (b && b.size <= 3 * 1024 * 1024) { res(b); return; }
+          }
+          rej(new Error('A photo is still too large after shrinking it.'));
+        };
+        im.onerror = () => { URL.revokeObjectURL(u); rej(new Error('A photo could not be read.')); };
+        im.src = u;
+      });
+    }
+
+    /* Once published, the page's own copy holds everything. The browser-only
+       copy of the same edits would show every photo a second time, so it is
+       cleared. */
+    async function clearLocalEdits() {
+      [LS_KEY, LIB_KEY, CAPS_KEY, ADJ_KEY, 'vt-covers', 'vt-subs', 'vt-groups'].forEach(k => {
+        try { localStorage.removeItem(k); } catch (e) { }
+      });
+      try { if (updb) { updb.close(); updb = null; } } catch (e) { }
+      await new Promise(res => {
+        try {
+          const rq = indexedDB.deleteDatabase(UP_DB);
+          rq.onsuccess = rq.onerror = rq.onblocked = () => res();
+          setTimeout(res, 1500);
+        } catch (e) { res(); }
+      });
+    }
+
+    /* ---- owner login (cloud) ---- */
+    async function ensureLogin(force) {
+      let t = null;
+      try { t = localStorage.getItem(TOKEN_KEY); } catch (e) { }
+      if (t && !force) return t;
+      const pass = prompt('Owner password:');
+      if (!pass) return null;
+      const j = await cloudCall({ action: 'login', password: pass });
+      if (!j.ok || !j.token) {
+        alert(j._status === 404 || j._status === 503
+          ? 'Owner login is not set up on this site yet.'
+          : (j.error || 'Could not log in.'));
+        return null;
+      }
+      try { localStorage.setItem(TOKEN_KEY, j.token); } catch (e) { }
+      return j.token;
+    }
+
+    /* a call that needs the owner; logs in again once if the token ran out */
+    async function authedCall(body) {
+      let t = await ensureLogin(false);
+      if (!t) return { cancelled: true };
+      let j = await cloudCall(Object.assign({}, body, { token: t }));
+      if (j._status === 401) {
+        t = await ensureLogin(true);
+        if (!t) return { cancelled: true };
+        j = await cloudCall(Object.assign({}, body, { token: t }));
+      }
+      return j;
+    }
+
+    /* Ctrl+Shift+A / Ctrl+Shift+E on the live site: the site itself checks the
+       password, so there is none written in this page. */
+    async function adminUnlock() {
+      const t = await ensureLogin(true);
+      if (!t) return false;
+      try { localStorage.setItem('vt-admin', '1'); } catch (e) { }
+      window.READONLY = false;
+      document.body.classList.remove('readonly');
+      if (openIndex !== null) openCat(openIndex);
+      detectPublisher();
+      alert('Owner mode unlocked.');
+      return true;
+    }
+
+    function adminLock() {
+      try { localStorage.removeItem('vt-admin'); localStorage.removeItem(TOKEN_KEY); } catch (e) { }
+      window.READONLY = true;
+      document.body.classList.add('readonly');
+      document.body.classList.remove('editing');
+      if (openIndex !== null) openCat(openIndex);
+      detectPublisher();
+      alert('Owner mode locked.');
+    }
+
+    /* ---- cloud publish ---- */
+    async function publishCloud(message, setLabel) {
+      // log in FIRST: no point shrinking photos for someone who is not the owner
+      if (!(await ensureLogin(false))) return { cancelled: true };
+      const collect = {};
+      await exportAll({ collect });
+      if (collect.stillUp || (collect.missing && collect.missing.length)) {
+        throw new Error('Some uploaded photos could not be read, so nothing was published. Remove them and add them again, then retry.');
+      }
+      const list = collect.files || [];
+      const files = [];
+      for (let i = 0; i < list.length; i++) {
+        setLabel('Uploading ' + (i + 1) + '/' + list.length + '…');
+        const name = list[i].name + '.jpg';
+        const data = await blobToBase64(await webJpeg(list[i].blob));
+        const j = await authedCall({ action: 'upload', name, data });
+        if (j.cancelled) return { cancelled: true };
+        if (!j.ok) throw new Error(j.error || 'Upload failed.');
+        files.push({ name, sha: j.sha });
+      }
+      setLabel('Publishing…');
+      const j = await authedCall({
+        action: 'publish', content: collect.out, files,
+        baseV: String(BASE_CONTENT._v || ''), message
+      });
+      if (j.cancelled) return { cancelled: true };
+      if (!j.ok) throw new Error(j.error || 'Publish failed.');
+      return { ok: true, v: j.v, commit: j.commit };
+    }
+
+    /* Netlify takes a minute or two to deploy a commit. Until it has, the live
+       page is the old one, so keep the owner's edits showing and clear them
+       only once the new version is actually being served. */
+    async function waitForDeploy(v, setLabel) {
+      const url = location.href.split('#')[0];
+      const t0 = Date.now();
+      while (Date.now() - t0 < 6 * 60 * 1000) {
+        setLabel('Waiting for Netlify… ' + Math.round((Date.now() - t0) / 1000) + 's');
+        await new Promise(r => setTimeout(r, 8000));
+        try {
+          const txt = await (await fetch(url, { cache: 'no-store' })).text();
+          if (txt.includes('"_v": ' + v)) return true;
+        } catch (e) { /* try again */ }
+      }
+      return false;
+    }
+
+    /* If the tab was closed while waiting, finish the job on the next visit. */
+    (async function resolvePendingPublish() {
+      let p = null;
+      try { p = JSON.parse(localStorage.getItem(PENDING_KEY)); } catch (e) { }
+      if (!p) return;
+      if (Number(BASE_CONTENT._v || 0) >= Number(p.v || 0) && p.v) {
+        await clearLocalEdits();
+        try { localStorage.removeItem(PENDING_KEY); } catch (e) { }
+        location.reload();
+      } else if (Date.now() - (p.at || 0) > 24 * 3600 * 1000) {
+        try { localStorage.removeItem(PENDING_KEY); } catch (e) { }
+      }
+    })();
+
+    async function publishSite() {
+      if (!publishMode) { alert('Publish is not available here.'); return; }
+      const message = prompt(
+        'Publish to the live site?\n\n' +
+        'This saves your photos and arrangement and updates ' +
+        (publishMode === 'cloud' ? 'https://velvet-theory.netlify.app' : 'GitHub, and so the live site') +
+        ' within a minute or two.\n\n' +
+        'Describe this update (optional), then press OK. Cancel stops.', '');
+      if (message === null) return;
+
+      const btn = document.getElementById('ed-publish');
+      const was = btn ? btn.textContent : '';
+      const setLabel = t => { if (btn) btn.textContent = t; };
+      if (btn) btn.disabled = true;
+      setLabel('Publishing…');
+      let saved = false;
+      try {
+        if (publishMode === 'cloud') {
+          const r = await publishCloud(message.trim(), setLabel);
+          if (r.cancelled) return;
+          saved = true;
+          try { localStorage.setItem(PENDING_KEY, JSON.stringify({ v: r.v, at: Date.now() })); } catch (e) { }
+          const live = await waitForDeploy(r.v, setLabel);
+          if (live) {
+            await clearLocalEdits();
+            try { localStorage.removeItem(PENDING_KEY); } catch (e) { }
+            alert('Published — the live site is updated.');
+            location.reload();
+          } else {
+            alert('Your changes are saved (commit ' + r.commit + ') and Netlify is still building.\n\n' +
+              'Nothing is lost: your edits stay in this browser and clear by themselves once the new version is live.');
+          }
+          return;
+        }
+
+        // local helper
+        const collect = {};
+        await exportAll({ collect });
+        if (collect.stillUp || (collect.missing && collect.missing.length)) {
+          throw new Error('Some uploaded photos could not be read, so nothing was published. Remove them and add them again, then retry.');
+        }
+        const images = [];
+        for (const f of (collect.files || [])) images.push({ name: f.name + '.jpg', data: await blobToBase64(f.blob) });
+        const res = await fetch('/__publish', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Publish-Token': publishToken },
+          body: JSON.stringify({ content: collect.out, images, message: message.trim() })
+        });
+        const j = await res.json().catch(() => ({}));
+        saved = !!j.saved;
+        if (!res.ok || !j.ok) throw new Error(j.error || ('The helper answered HTTP ' + res.status));
+        await clearLocalEdits();
+        alert('Published.\n\n' + (j.summary || '') + '\n\nNetlify will show the update at https://velvet-theory.netlify.app within a minute or two.');
+        location.reload();
+      } catch (err) {
+        if (saved && publishMode === 'local') {
+          // the files were already written: the browser-only copy would now double everything
+          await clearLocalEdits();
+          alert('Your changes were saved into the project, but the upload did not finish:\n\n' + (err.message || err) +
+            '\n\nOpen a terminal in the project folder and run:  git push');
+          location.reload();
+        } else {
+          alert('Publish failed — nothing was changed on the live site:\n\n' + (err.message || err));
+        }
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = was || 'Publish'; }
       }
     }
 
@@ -9870,50 +10185,21 @@ const BASE_CONTENT = ${text};
       }
     });
 
-    /* Ctrl+Shift+A unlocks or locks owner admin mode */
+    /* Ctrl+Shift+A unlocks or locks owner mode. Unlocking asks the site itself
+       (the Netlify function) to check the password, so no password is written
+       in this page. */
     document.addEventListener('keydown', e => {
       if (e.ctrlKey && e.shiftKey && (e.key === 'A' || e.key === 'a')) {
         e.preventDefault();
-        if (window.READONLY) {
-          const pass = prompt('Enter Owner / Admin password:');
-          if (pass === 'velvet' || pass === 'admin' || pass === 'vt2026' || pass === 'theory') {
-            try { localStorage.setItem('vt-admin', '1'); } catch (err) { }
-            window.READONLY = false;
-            document.body.classList.remove('readonly');
-            if (openIndex !== null) openCat(openIndex);
-            alert('Owner admin mode unlocked.');
-          } else if (pass) {
-            alert('Incorrect password.');
-          }
-        } else {
-          if (confirm('Lock owner admin mode on this browser?')) {
-            try { localStorage.removeItem('vt-admin'); } catch (err) { }
-            window.READONLY = true;
-            document.body.classList.add('readonly');
-            document.body.classList.remove('editing');
-            if (openIndex !== null) openCat(openIndex);
-            alert('Admin mode locked.');
-          }
-        }
+        if (window.READONLY) adminUnlock();
+        else if (confirm('Lock owner mode on this browser?')) adminLock();
       }
     });
 
     document.addEventListener('keydown', e => {
       if (e.ctrlKey && e.shiftKey && (e.key === 'E' || e.key === 'e')) {
         if (window.READONLY) {
-          const unlock = confirm('Admin mode is locked. Would you like to enter your owner password to unlock editing?');
-          if (unlock) {
-            const pass = prompt('Enter Owner / Admin password:');
-            if (pass === 'velvet' || pass === 'admin' || pass === 'vt2026' || pass === 'theory') {
-              try { localStorage.setItem('vt-admin', '1'); } catch (err) { }
-              window.READONLY = false;
-              document.body.classList.remove('readonly');
-              if (openIndex !== null) openCat(openIndex);
-              alert('Owner admin mode unlocked.');
-            } else if (pass) {
-              alert('Incorrect password.');
-            }
-          }
+          if (confirm('Owner mode is locked. Log in to unlock editing?')) adminUnlock();
           return;
         }
         e.preventDefault();

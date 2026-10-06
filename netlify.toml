@@ -9,6 +9,12 @@
   command = ""
   publish = "PUBLISH"
 
+# The owner-only publishing function (see netlify/functions/admin.js). It is
+# built by Netlify from the repository, so this only takes effect on deploys
+# that come from GitHub, not on a dragged-in folder.
+[functions]
+  directory = "netlify/functions"
+
 # ---- caching ----
 # The photographs never change once published: a new photograph gets a
 # new filename. So they can be cached hard, which makes a repeat visit
